@@ -240,11 +240,11 @@ memory/
 
 ## Why This Exists
 
-On March 29, 2026, a sub-agent completed a book manuscript polish pass across 14 chapters. It committed the work locally and reported success. The git push had silently failed — the remote had never been configured on a re-initialized local repository.
+On March 29, 2026, a sub-agent completed a task from an orchastration agent. It committed the work locally and reported success. A git push had silently failed — the remote had never been configured on a re-initialized local repository.
 
 The work existed on one machine. The remote repo didn't have it. The agent didn't know. The user didn't know until they checked manually hours later.
 
-SAV was built the same morning. With SAV in place, the `git_remote` and `git_pushed` checks would have caught the failure immediately, blocked the "done" report, and fired a Slack alert — before the agent said a word.
+SAV was built to address these potential failure points. With SAV in place, the `git_remote` and `git_pushed` checks would have caught the failure immediately, blocked the "done" report, and fired a Slack alert — before the agent said a word.  Now this works for any action that a sub-agent may stall on.
 
 ---
 
@@ -267,7 +267,7 @@ SAV occupies a unique niche: lightweight, connector-agnostic, shell-native, and 
 
 ## License
 
-MIT — use freely, attribution appreciated.
+MIT — use freely, attribution appreciated.  Thanks!  Karl.
 
 ---
 
