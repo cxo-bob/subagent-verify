@@ -1,4 +1,4 @@
-# SubAgent Verify — State Machine Reference
+# SAV — State Machine Reference
 
 ## State Diagram
 
@@ -6,77 +6,111 @@
 pre-spawn
     │
     ▼  sv.sh register
-in-progress          ← subagent is running
+in-progress             ← sub-agent is running
     │
     ▼  sv.sh complete
-completed-unverified ← subagent returned, not yet checked
+completed-unverified    ← sub-agent returned, checks not yet run
     │
-    ├─► verified          ✅ all checks passed → safe to report done to Karl
-    ├─► failed            ❌ checks failed → work is actually missing/broken
-    ├─► verify-errored    ⚠️  the verify script itself crashed
-    ├─► verify-blocked    🔁 external dep unavailable (GitHub down, etc.) → retry
-    ├─► needs-human-review 🙋 timed out (>2h) or ambiguous → Karl decides
-    └─► force-completed   🔑 Karl manually closed it with reason logged
+    ├─► verified            ✅ all checks passed → safe to report done to Karl
+    ├─► failed              ❌ checks failed, retries available → re-verify after fix
+    ├─► verify-errored      ⚠️  verify script itself crashed
+    ├─► verify-blocked      🔁 external dep unavailable → auto-retry with backoff
+    ├─► needs-human-review  🙋 timed out (>2h) or retries exhausted → Karl decides
+    └─► force-completed     🔑 Karl manual override, reason permanently logged
 ```
 
 ## State Descriptions
 
 | State | Meaning | Next action |
 |-------|---------|-------------|
-| `in-progress` | Subagent is working | Wait for return, then `sv.sh complete` |
-| `completed-unverified` | Subagent returned | Run `sv.sh verify <id>` immediately |
-| `verified` | All checks passed | Safe to tell Karl it's done. Write lesson to MEMORY.md |
-| `failed` | Checks failed | Fix the work, re-run `sv.sh verify <id>` |
-| `verify-errored` | Script crashed | Alert Karl. Check script error. Fix, then re-run verify |
-| `verify-blocked` | External dep down | Retry after backoff. Do NOT mark failed |
-| `needs-human-review` | Timed out (>2h) | Alert Karl via Telegram/Slack. Karl decides |
-| `force-completed` | Karl override | Reason logged. Treated as closed |
+| `in-progress` | Sub-agent is working | Wait, then `sv.sh complete` |
+| `completed-unverified` | Returned, not checked | `sv.sh verify <id>` immediately |
+| `verified` | All checks passed ✅ | Tell Karl it's done. Write lesson to MEMORY.md |
+| `failed` | Checks failed | Fix work, re-run `sv.sh verify`. Retry scheduled |
+| `verify-errored` | Script crashed | Alert Karl. Fix script, re-run verify |
+| `verify-blocked` | External dep down | Auto-retry scheduled. Do NOT mark failed |
+| `needs-human-review` | Timeout or retries exhausted | Alert Karl. Karl decides next step |
+| `force-completed` | Karl override | Reason logged permanently. Treated as closed |
+
+## Auto-Retry (Exponential Backoff)
+
+For `verify-blocked` (network/external failures):
+- retry_max: configurable per task (default: 3)
+- retry_backoff_base: configurable per task (default: 60s)
+- Backoff schedule: `base * 2^(retry_count-1)`
+  - Attempt 1: 60s
+  - Attempt 2: 120s
+  - Attempt 3: 240s
+- Heartbeat `auto-retry` command triggers re-verify when window elapses
+- After retry_max exhausted → `needs-human-review` + Slack alert
+
+## Slack Push Notifications
+
+Fires automatically on: `failed`, `verify-errored`, `verify-blocked`, `needs-human-review`
+
+Configure:
+```json
+"SLACK_SAV_WEBHOOK": "https://hooks.slack.com/services/...",
+"SLACK_SAV_CHANNEL": "#bobs-office"
+```
+
+Each alert includes:
+- Task ID and description
+- Current status
+- Last failure detail
+- Recovery commands (copy-paste ready)
+
+## Audit Logs
+
+Each task writes a persistent log: `memory/sav-logs/<task-id>.log`
+
+View with: `sv.sh history <task-id>`  
+Includes: full state transition history + last verify check results + timestamped activity log
 
 ## Timeout Rules
 
 - Default timeout: 7200 seconds (2 hours)
-- Heartbeat checks for tasks stuck `in-progress` or `completed-unverified` beyond timeout
+- Heartbeat checks for tasks stuck beyond timeout
 - On timeout: auto-advance to `needs-human-review`, alert Karl
 
 ## Recovery Paths
 
 ### State file corrupt
-```bash
-sv.sh recover
-# Restores from subagent-state.json.bak automatically
 ```
+--sv recover
+```
+Restores from `.bak` automatically.
 
 ### Task stuck, want to retry
-```bash
-sv.sh reset <task-id> "reason"
-# Sets back to in-progress, logs reason
 ```
+--sv reset <task-id> "reason"
+```
+Sets back to `in-progress`, clears retry timer, logs reason.
 
 ### Work confirmed good but checks wrong
-```bash
-sv.sh force-complete <task-id> "checks were wrong — git pushed to different branch"
-# Logs reason permanently in history
 ```
+--sv force-complete <task-id> "checks were wrong — git pushed to different branch"
+```
+Logs reason permanently in history.
 
-### All of the above from chat (no terminal)
-Karl sends any of these to me via Telegram/Slack:
-- `--sv status` → I run `sv.sh status` and report back
-- `--sv reset <id> <reason>` → I run `sv.sh reset`
-- `--sv force-complete <id> <reason>` → I run `sv.sh force-complete`
-- `--sv recover` → I run `sv.sh recover`
-- `--sv list-stuck` → I list all hung tasks
+### See full history on a task
+```
+--sv history <task-id>
+```
+Shows state transitions, last verify results, activity log.
+
+### All recovery works from chat
+Karl sends `--sv <command>` via Telegram, Slack, or any connector.  
+No terminal access required. I execute and report back.
 
 ## File Locations
 
-| File | Path | Purpose |
-|------|------|---------|
-| State | `~/.openclaw/workspace/memory/subagent-state.json` | Live task states |
-| Backup | `~/.openclaw/workspace/memory/subagent-state.json.bak` | Auto-backup before every write |
-| Script | `~/.openclaw/workspace/skills/subagent-verify/scripts/sv.sh` | The CLI |
-| SKILL.md | `~/.openclaw/workspace/skills/subagent-verify/SKILL.md` | Protocol doc |
+| File | Path |
+|------|------|
+| State | `~/.openclaw/workspace/memory/subagent-state.json` |
+| Backup | `~/.openclaw/workspace/memory/subagent-state.json.bak` |
+| Logs | `~/.openclaw/workspace/memory/sav-logs/<task-id>.log` |
+| Script | `~/.openclaw/workspace/skills/subagent-verify/scripts/sv.sh` |
+| SKILL.md | `~/.openclaw/workspace/skills/subagent-verify/SKILL.md` |
 
-## Why User-Space?
-
-All files live under `~/.openclaw/workspace/` — never under `/opt/homebrew/lib/node_modules/openclaw/`.
-OpenClaw updates touch only the node_modules path. This skill, its scripts, and all state files
-are completely safe from updates.
+All paths under `~/.openclaw/workspace/` — never touched by OpenClaw updates.

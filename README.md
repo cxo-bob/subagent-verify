@@ -47,7 +47,7 @@ The protocol is simple:
 
 If verification fails, the agent fixes the work and re-verifies. It cannot skip to "done."
 
-If the system is interrupted at any point, the state file persists on disk. The next heartbeat reads it, sees the unfinished state, and alerts. Recovery commands work from any channel — no terminal required.
+If the system is interrupted at any point, the state file persists on disk. The next heartbeat reads it, sees the unfinished state, and alerts. Blocked tasks auto-retry with exponential backoff. Recovery commands work from any channel — no terminal required.
 
 ---
 
@@ -59,20 +59,51 @@ If the system is interrupted at any point, the state file persists on disk. The 
 pre-spawn
     │
     ▼  register
-in-progress          ← sub-agent is running
+in-progress             ← sub-agent is running
     │
     ▼  complete
-completed-unverified ← sub-agent returned, checks not yet run
+completed-unverified    ← sub-agent returned, checks not yet run
     │
     ├─► verified            ✅ all checks passed → safe to report done
-    ├─► failed              ❌ checks failed → fix work, re-verify
+    ├─► failed              ❌ checks failed, retries available → fix + re-verify
     ├─► verify-errored      ⚠️  verify script itself crashed
-    ├─► verify-blocked      🔁 external dependency unavailable → retry
-    ├─► needs-human-review  🙋 timed out (>2h) → human decides
-    └─► force-completed     🔑 manual override with reason logged
+    ├─► verify-blocked      🔁 external dep unavailable → auto-retry with backoff
+    ├─► needs-human-review  🙋 timed out or retries exhausted → human decides
+    └─► force-completed     🔑 manual override, reason permanently logged
 ```
 
 Every state transition is written to disk before proceeding. A backup (`.bak`) is created before every write. If the state file becomes corrupt, recovery restores from the backup automatically.
+
+### Auto-Retry with Exponential Backoff
+
+When a verification check fails due to a network or external dependency issue (GitHub unreachable, URL down, etc.), SAV enters `verify-blocked` and schedules an automatic retry:
+
+```
+Attempt 1: wait 60s
+Attempt 2: wait 120s
+Attempt 3: wait 240s
+```
+
+The backoff base and retry maximum are configurable per task. When the window elapses, the heartbeat's `auto-retry` command re-runs verification automatically. After all retries are exhausted, the task escalates to `needs-human-review` and fires a Slack alert.
+
+This means transient failures (GitHub API blip, temporary network issue) resolve themselves without human intervention.
+
+### Push Notifications
+
+SAV fires a Slack alert automatically when any task enters a failure state:
+
+- `failed` — checks failed
+- `verify-errored` — the verify script itself crashed
+- `verify-blocked` — external dependency unavailable
+- `needs-human-review` — timeout or retries exhausted
+
+Each alert includes the task ID, description, failure detail, and copy-paste recovery commands.
+
+Configure with a Slack webhook URL in your agent's environment config.
+
+### Audit Log
+
+Every task writes a persistent log to `memory/sav-logs/<task-id>.log`. View the full history — state transitions, verify results, activity timestamps — with `sv.sh history <task-id>`.
 
 ### Check Types
 
@@ -85,10 +116,13 @@ Checks are defined when the task is registered and run automatically during veri
 | `git_remote` | A git repo has a remote configured |
 | `git_pushed` | Local HEAD matches remote branch (push confirmed) |
 | `cmd_succeeds` | Any shell command exits with code 0 |
+| `url_reachable` | A URL responds with HTTP 200 |
 
 ### Heartbeat Integration
 
-On every heartbeat cycle, SAV checks for stuck tasks. Any task stuck in a non-terminal state beyond its timeout threshold generates an alert. Tasks stuck for more than 2 hours are auto-escalated to `needs-human-review`.
+On every heartbeat cycle:
+1. `sv.sh auto-retry` — silently re-verifies any `verify-blocked` tasks whose backoff window has elapsed
+2. `sv.sh list-stuck` — checks for tasks stuck in non-terminal states, alerts if found
 
 ### Chat-Based Recovery
 
@@ -98,10 +132,11 @@ Recovery commands work from any messaging surface — Telegram, Slack, WhatsApp,
 |---------|--------|
 | `--sv status` | Show all task states |
 | `--sv list-stuck` | Show only hung tasks |
-| `--sv reset <id> <reason>` | Reset a task to in-progress, reason logged |
+| `--sv history <id>` | Full audit log for a task |
+| `--sv reset <id> <reason>` | Reset to in-progress, reason logged |
 | `--sv force-complete <id> <reason>` | Manual override, reason permanently logged |
 | `--sv recover` | Restore corrupt state from backup |
-| `--sv verify <id>` | Re-run verification on a specific task |
+| `--sv verify <id>` | Re-run verification |
 
 ---
 
@@ -110,17 +145,20 @@ Recovery commands work from any messaging surface — Telegram, Slack, WhatsApp,
 ### 1. Install
 
 ```bash
-# Clone into your agent's skills directory
-git clone https://github.com/KD-Ventures/subagent-verify ~/.openclaw/workspace/skills/subagent-verify
-
-# Make the script executable
+git clone https://github.com/cxo-bob/subagent-verify ~/.openclaw/workspace/skills/subagent-verify
 chmod +x ~/.openclaw/workspace/skills/subagent-verify/scripts/sv.sh
-
-# Initialize the state file
 echo '{"tasks":{}}' > ~/.openclaw/workspace/memory/subagent-state.json
 ```
 
-### 2. Register a task before spawning
+### 2. Configure Slack notifications (optional)
+
+Add to your agent's `openclaw.json` under `env`:
+```json
+"SLACK_SAV_WEBHOOK": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+"SLACK_SAV_CHANNEL": "#your-channel"
+```
+
+### 3. Register a task before spawning a sub-agent
 
 ```bash
 bash skills/subagent-verify/scripts/sv.sh register \
@@ -130,55 +168,50 @@ bash skills/subagent-verify/scripts/sv.sh register \
     {"type": "git_remote", "value": "/path/to/repo"},
     {"type": "git_pushed", "dir": "/path/to/repo", "branch": "main"},
     {"type": "file_exists", "value": "/path/to/output/ch1-polished.md"}
-  ]'
+  ]' \
+  3 60
+# 3 retries, 60s base backoff
 ```
 
-### 3. After sub-agent returns
+### 4. After sub-agent returns
 
 ```bash
 bash skills/subagent-verify/scripts/sv.sh complete "book-polish-2026-03-29"
 ```
 
-### 4. Verify before reporting done
+### 5. Verify before reporting done
 
 ```bash
 bash skills/subagent-verify/scripts/sv.sh verify "book-polish-2026-03-29"
-# Output: ✅ VERIFIED: book-polish-2026-03-29
+# ✅ VERIFIED: book-polish-2026-03-29
 # Only now report success to the user
 ```
 
-### 5. Check status at any time
+### 6. Add to HEARTBEAT.md
 
-```bash
-bash skills/subagent-verify/scripts/sv.sh status
-# ✅ book-polish-2026-03-29: verified — Polish pass across all 14 chapters
+```markdown
+## Step 0 — SubAgent Verify
+- Run: `bash skills/subagent-verify/scripts/sv.sh auto-retry`
+- Run: `bash skills/subagent-verify/scripts/sv.sh list-stuck`
+- Alert on any stuck tasks. Push notifications fire automatically on failures.
+```
+
+### 7. Add to AGENTS.md
+
+```markdown
+## SubAgent Verify Gate (unbreakable)
+Before spawning: register with checks.
+After returns: complete → verify.
+Do not report done until status is `verified` or `force-completed`.
 ```
 
 ---
 
 ## Integration with OpenClaw
 
-SAV is built as an [OpenClaw](https://openclaw.ai) AgentSkill. Place the skill directory under `~/.openclaw/workspace/skills/subagent-verify/` and OpenClaw will load it automatically.
+SAV is built as an [OpenClaw](https://openclaw.ai) AgentSkill. Place the skill directory under `~/.openclaw/workspace/skills/subagent-verify/` and OpenClaw will load `SKILL.md` automatically.
 
-The skill directory is in user-space (`~/.openclaw/workspace/`) and is never touched by OpenClaw updates.
-
-Add to your `HEARTBEAT.md`:
-
-```markdown
-## Step 0 — SubAgent Verify check
-- Run: `bash skills/subagent-verify/scripts/sv.sh list-stuck`
-- Alert if any task is stuck in a non-terminal state
-- Check that `memory/subagent-state.json.bak` exists and is < 4 hours old
-```
-
-Add to your `AGENTS.md`:
-
-```markdown
-## SubAgent Verify Gate (unbreakable rule)
-Before spawning: register the task with checks.
-After returns: complete → verify.
-Do not report done until status is `verified` or `force-completed`.
-```
+All files live in user-space (`~/.openclaw/workspace/`) and are never touched by OpenClaw updates.
 
 ---
 
@@ -186,19 +219,21 @@ Do not report done until status is `verified` or `force-completed`.
 
 ```
 subagent-verify/
-├── SKILL.md                         # OpenClaw skill definition + protocol
+├── SKILL.md                         # OpenClaw skill definition + full protocol
 ├── scripts/
 │   └── sv.sh                        # The CLI — all state operations
 └── references/
-    ├── state-machine.md             # Full state diagram + recovery paths
+    ├── state-machine.md             # Full state diagram, retry logic, recovery paths
     └── check-types.md               # All check types with examples
 ```
 
-State files (live in your agent's memory directory):
+Runtime state files (in your agent's memory directory):
 ```
 memory/
 ├── subagent-state.json              # Live task state
-└── subagent-state.json.bak          # Auto-backup before every write
+├── subagent-state.json.bak          # Auto-backup before every write
+└── sav-logs/
+    └── <task-id>.log                # Per-task audit log
 ```
 
 ---
@@ -207,9 +242,26 @@ memory/
 
 On March 29, 2026, a sub-agent completed a book manuscript polish pass across 14 chapters. It committed the work locally and reported success. The git push had silently failed — the remote had never been configured on a re-initialized local repository.
 
-The work existed on one machine. The remote repo didn't have it. The agent didn't know. The user didn't know until they checked manually.
+The work existed on one machine. The remote repo didn't have it. The agent didn't know. The user didn't know until they checked manually hours later.
 
-SAV was built the same morning. With SAV in place, `git_remote` and `git_pushed` checks would have caught the failure immediately and blocked the completion report. The agent would have fixed the push before saying a word.
+SAV was built the same morning. With SAV in place, the `git_remote` and `git_pushed` checks would have caught the failure immediately, blocked the "done" report, and fired a Slack alert — before the agent said a word.
+
+---
+
+## Comparison with Existing Frameworks
+
+| | SAV | LangGraph | Temporal | OpenAI Agents SDK |
+|--|-----|-----------|----------|-------------------|
+| Disk-persisted state | ✅ | ✅ (with config) | ✅ | ❌ in-memory |
+| Framework lock-in | ❌ none | ✅ Python/LangChain | ✅ server + SDK | ✅ OpenAI SDK |
+| Drop-in to existing setup | ✅ 5 min | ❌ rebuild required | ❌ infrastructure | ❌ rebuild required |
+| Chat-based recovery | ✅ any channel | ❌ | ❌ | ❌ |
+| Auto-retry with backoff | ✅ | ✅ | ✅ | ❌ |
+| Push notifications | ✅ Slack | ✅ (custom) | ✅ (custom) | ❌ |
+| Shell-native | ✅ bash/python | ❌ | ❌ | ❌ |
+| Per-task audit log | ✅ | ✅ | ✅ | ❌ |
+
+SAV occupies a unique niche: lightweight, connector-agnostic, shell-native, and drop-in to any existing agent setup without framework lock-in.
 
 ---
 
@@ -218,8 +270,6 @@ SAV was built the same morning. With SAV in place, `git_remote` and `git_pushed`
 MIT — use freely, attribution appreciated.
 
 ---
-
-## Part of the KD Ventures AI Infrastructure Stack
 
 Built and maintained by [KD Ventures](https://github.com/KD-Ventures).  
 OpenClaw: [openclaw.ai](https://openclaw.ai)
